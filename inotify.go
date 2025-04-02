@@ -243,7 +243,7 @@ func (w *sWatcher) parseEvents(data []byte) {
 			statTtime := info.Sys().(*syscall.Stat_t)
 			event.CreateTime = w.timespecToTime(statTtime.Ctim)
 			event.ModifyTime = w.timespecToTime(statTtime.Mtim)
-			if time.Now().UTC().Sub(event.CreateTime).Seconds() < 1 {
+			if !event.CreateTime.IsZero() && time.Now().UTC().Sub(event.CreateTime).Seconds() < 1 {
 				event.Type = "CREATE"
 			}
 		}
@@ -255,6 +255,9 @@ func (w *sWatcher) parseEvents(data []byte) {
 }
 
 func (w *sWatcher) timespecToTime(ts syscall.Timespec) time.Time {
+	if ts.Sec == 0 && ts.Nsec == 0 {
+		return time.Time{}
+	}
 	return time.Unix(ts.Sec, ts.Nsec)
 }
 
