@@ -3,12 +3,10 @@ package inotify
 import (
 	"fmt"
 	"strings"
-
-	"golang.org/x/sys/unix"
 )
 
 type (
-	Op     uint32
+	Op     int
 	koekje struct {
 		cookie uint32
 		path   string
@@ -22,15 +20,15 @@ type (
 )
 
 const (
-	ACCESS Op = unix.IN_ACCESS
-	ATTRIB Op = unix.IN_ATTRIB
-	CLOSE  Op = unix.IN_CLOSE
-	CREATE Op = unix.IN_CREATE
-	DELETE Op = unix.IN_DELETE
-	MODIFY Op = unix.IN_MODIFY
-	MOVE   Op = unix.IN_MOVE
-	OPEN   Op = unix.IN_OPEN
-	All    Op = unix.IN_ALL_EVENTS
+	ACCESS Op = 1 << iota
+	ATTRIB
+	CLOSE
+	CREATE
+	DELETE
+	MODIFY
+	MOVE
+	OPEN
+	ALL_EVENTS
 )
 
 var eventBits = map[Op]string{

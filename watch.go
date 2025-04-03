@@ -15,6 +15,7 @@ type (
 		wd    uint32 // Watch descriptor (as returned by the inotify_add_watch() syscall)
 		flags int    // inotify flags of this watch (see inotify(7) for the list of valid flags)
 		path  string // Watch path.
+		mark  Op
 	}
 )
 

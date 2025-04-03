@@ -19,7 +19,8 @@ import (
 
 type IWatcher interface {
 	WatchList() []string
-	Add(path string, flags ...Op) error
+	Add(path string) error
+	AddWith(path string, flag Op) error
 	Remove(path string) error
 	Events() <-chan *Event
 	Errors() <-chan error
@@ -124,7 +125,11 @@ func (w *sWatcher) Errors() <-chan error {
 	return w.errorChan
 }
 
-func (w *sWatcher) Add(path string, flags ...Op) error {
+func (w *sWatcher) Add(path string) error {
+	return w.AddWith(path, ALL_EVENTS)
+}
+
+func (w *sWatcher) AddWith(path string, mark Op) error {
 	if w.isClosed() {
 		return fmt.Errorf("watcher is closed")
 	}
@@ -134,39 +139,37 @@ func (w *sWatcher) Add(path string, flags ...Op) error {
 		return fmt.Errorf("get abs path failed: %w", err)
 	}
 	// required type, recursive directories required
-	var _flags = unix.IN_DONT_FOLLOW | unix.IN_CREATE | unix.IN_DELETE | unix.IN_DELETE_SELF | unix.IN_IGNORED | unix.IN_UNMOUNT
-	for _, flag := range flags {
-		if flag&All != 0 {
-			_flags = unix.IN_ALL_EVENTS
-			break
-		} else {
-			if flag&ACCESS != 0 {
-				_flags |= unix.IN_ACCESS
-			}
-			if flag&ATTRIB != 0 {
-				_flags |= unix.IN_ATTRIB
-			}
-			if flag&CLOSE != 0 {
-				_flags |= unix.IN_CLOSE | unix.IN_CLOSE_WRITE | unix.IN_CLOSE_NOWRITE
-			}
-			if flag&MODIFY != 0 {
-				_flags |= unix.IN_MODIFY
-			}
-			if flag&MOVE != 0 {
-				_flags |= unix.IN_MOVED_TO | unix.IN_MOVED_FROM | unix.IN_MOVE_SELF
-			}
-			if flag&OPEN != 0 {
-				_flags |= unix.IN_OPEN
-			}
+	var _flags = unix.IN_DONT_FOLLOW | unix.IN_CREATE | unix.IN_DELETE |
+		unix.IN_DELETE_SELF | unix.IN_IGNORED | unix.IN_UNMOUNT
+	if mark&ALL_EVENTS == ALL_EVENTS {
+		_flags = unix.IN_ALL_EVENTS
+	} else {
+		if mark&ACCESS != 0 {
+			_flags |= unix.IN_ACCESS
+		}
+		if mark&ATTRIB != 0 {
+			_flags |= unix.IN_ATTRIB
+		}
+		if mark&CLOSE != 0 {
+			_flags |= unix.IN_CLOSE | unix.IN_CLOSE_WRITE | unix.IN_CLOSE_NOWRITE
+		}
+		if mark&MODIFY != 0 {
+			_flags |= unix.IN_MODIFY
+		}
+		if mark&MOVE != 0 {
+			_flags |= unix.IN_MOVED_TO | unix.IN_MOVED_FROM | unix.IN_MOVE_SELF
+		}
+		if mark&OPEN != 0 {
+			_flags |= unix.IN_OPEN
 		}
 	}
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.addWatchRecursive(absPath, _flags, false)
+	return w.addWatchRecursive(absPath, mark, _flags, false)
 }
 
-func (w *sWatcher) addWatchRecursive(path string, flags int, sedEvent bool) error {
+func (w *sWatcher) addWatchRecursive(path string, mark Op, flags int, sedEvent bool) error {
 	return filepath.Walk(path, func(root string, fi os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -178,18 +181,19 @@ func (w *sWatcher) addWatchRecursive(path string, flags int, sedEvent bool) erro
 			}
 			return nil
 		}
-		if sedEvent {
+		// 判断mark是否为ALL_EVENTS或CREATE
+		if sedEvent && (mark&CREATE == CREATE || mark == ALL_EVENTS) {
 			w.sendEvent(&Event{
-				Type:  unix.IN_CREATE,
+				Type:  CREATE,
 				Path:  root,
 				IsDir: true,
 			})
 		}
-		return w.register(root, flags)
+		return w.register(root, mark, flags)
 	})
 }
 
-func (w *sWatcher) register(path string, flags int) error {
+func (w *sWatcher) register(path string, mark Op, flags int) error {
 	return w.watches.updatePath(path, func(existing *watch) (*watch, error) {
 		if existing != nil {
 			flags |= existing.flags | unix.IN_MASK_ADD
@@ -203,10 +207,12 @@ func (w *sWatcher) register(path string, flags int) error {
 				wd:    uint32(wd),
 				path:  path,
 				flags: flags,
+				mark:  mark,
 			}, nil
 		}
 		existing.wd = uint32(wd)
 		existing.flags = flags
+		existing.mark = mark
 		return existing, nil
 	})
 }
@@ -354,7 +360,7 @@ func (w *sWatcher) handleEvent(inEvent *unix.InotifyEvent, buf *[eventBufferSize
 
 	if ev.IsDir && ev.Has(CREATE) {
 		// mkdir -p create chain directory, recursive watch it.
-		err := w.addWatchRecursive(ev.Path, _watch.flags, true)
+		err := w.addWatchRecursive(ev.Path, _watch.mark, _watch.flags, true)
 		if !w.sendError(err) {
 			return nil, false
 		}
@@ -378,6 +384,9 @@ func (w *sWatcher) handleEvent(inEvent *unix.InotifyEvent, buf *[eventBufferSize
 				}
 			}
 		}
+	}
+	if _watch.mark != ALL_EVENTS && !ev.Has(_watch.mark) {
+		return nil, true
 	}
 	return ev, true
 }
