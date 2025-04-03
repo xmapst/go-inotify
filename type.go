@@ -30,6 +30,7 @@ const (
 	MODIFY Op = unix.IN_MODIFY
 	MOVE   Op = unix.IN_MOVE
 	OPEN   Op = unix.IN_OPEN
+	All    Op = unix.IN_ALL_EVENTS
 )
 
 var eventBits = map[Op]string{
