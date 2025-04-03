@@ -3,9 +3,9 @@
 package inotify
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,19 +17,32 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+type IWatcher interface {
+	WatchList() []string
+	Add(path string) error
+	Remove(path string) error
+	Events() <-chan *Event
+	Errors() <-chan error
+	Close() error
+}
+
+const eventBufferSize = 4096 * (unix.SizeofInotifyEvent + unix.NAME_MAX + 1)
+
 type sWatcher struct {
-	fd        int
-	epollFd   int
-	watchLock sync.Mutex
-	watchMap  map[int32]string
-	renameMap map[uint32]*Event
 	eventChan chan *Event
-	errors    chan error
-	done      chan struct{}
-	// 用于防抖动
-	debounceMu       sync.Mutex
-	debounceMap      map[string]*time.Timer
-	debounceDuration time.Duration
+	errorChan chan error
+
+	fd          int
+	inotifyFile *os.File
+	watches     *watches
+
+	done     chan struct{}
+	doneMu   sync.Mutex
+	doneResp chan struct{}
+
+	cookies     [10]koekje
+	cookieIndex uint8
+	cookiesMu   sync.Mutex
 }
 
 func New() (IWatcher, error) {
@@ -38,36 +51,66 @@ func New() (IWatcher, error) {
 		return nil, fmt.Errorf("inotify init failed: %w", err)
 	}
 
-	epollFd, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
-	if err != nil {
-		_ = unix.Close(fd)
-		return nil, fmt.Errorf("epoll create failed: %w", err)
-	}
-
-	event := unix.EpollEvent{
-		Events: unix.EPOLLIN,
-		Fd:     int32(fd),
-	}
-	if err = unix.EpollCtl(epollFd, unix.EPOLL_CTL_ADD, fd, &event); err != nil {
-		_ = unix.Close(fd)
-		_ = unix.Close(epollFd)
-		return nil, fmt.Errorf("epoll ctl failed: %w", err)
-	}
-
 	w := &sWatcher{
-		fd:               fd,
-		epollFd:          epollFd,
-		watchMap:         make(map[int32]string),
-		renameMap:        make(map[uint32]*Event),
-		eventChan:        make(chan *Event, 65535),
-		errors:           make(chan error, 1024),
-		done:             make(chan struct{}),
-		debounceMap:      make(map[string]*time.Timer),
-		debounceDuration: 300 * time.Millisecond,
+		fd:          fd,
+		inotifyFile: os.NewFile(uintptr(fd), ""),
+		watches:     newWatches(),
+		eventChan:   make(chan *Event, 65535),
+		errorChan:   make(chan error, 1024),
+		done:        make(chan struct{}),
+		doneResp:    make(chan struct{}),
 	}
 
 	go w.eventLoop()
 	return w, nil
+}
+
+func (w *sWatcher) sendEvent(e *Event) bool {
+	select {
+	case <-w.done:
+		return false
+	case w.eventChan <- e:
+		return true
+	}
+}
+
+func (w *sWatcher) sendError(err error) bool {
+	if err == nil {
+		return true
+	}
+	select {
+	case <-w.done:
+		return false
+	case w.errorChan <- err:
+		return true
+	}
+}
+
+func (w *sWatcher) isClosed() bool {
+	select {
+	case <-w.done:
+		return true
+	default:
+		return false
+	}
+}
+
+func (w *sWatcher) Close() error {
+	w.doneMu.Lock()
+	if w.isClosed() {
+		w.doneMu.Unlock()
+		return nil
+	}
+	close(w.done)
+	w.doneMu.Unlock()
+
+	_ = unix.Close(w.fd)
+	err := w.inotifyFile.Close()
+	if err != nil {
+		return err
+	}
+	<-w.doneResp
+	return nil
 }
 
 func (w *sWatcher) Events() <-chan *Event {
@@ -75,182 +118,222 @@ func (w *sWatcher) Events() <-chan *Event {
 }
 
 func (w *sWatcher) Errors() <-chan error {
-	return w.errors
-}
-
-func (w *sWatcher) Remove(path string) error {
-	w.watchLock.Lock()
-	defer w.watchLock.Unlock()
-	path = filepath.Clean(path)
-
-	for _wd, _path := range w.watchMap {
-		if !strings.HasPrefix(_path, path) {
-			continue
-		}
-		delete(w.watchMap, _wd)
-		_, _, e1 := unix.RawSyscall(syscall.SYS_INOTIFY_RM_WATCH, uintptr(w.fd), uintptr(_wd), 0)
-		if e1 != 0 {
-			return fmt.Errorf("inotify rm watch failed: %w", e1)
-		}
-		return nil
-	}
-	return nil
+	return w.errorChan
 }
 
 func (w *sWatcher) Add(path string) error {
+	if w.isClosed() {
+		return fmt.Errorf("watcher is closed")
+	}
 	cleanPath := filepath.Clean(path)
 	absPath, err := filepath.Abs(cleanPath)
 	if err != nil {
 		return fmt.Errorf("get abs path failed: %w", err)
 	}
-	return w.addWatchRecursive(absPath)
+	return w.addWatchRecursive(absPath, false)
 }
 
-func (w *sWatcher) addWatchRecursive(path string) error {
-	return filepath.Walk(path, func(p string, fi os.FileInfo, err error) error {
+func (w *sWatcher) addWatchRecursive(path string, sedEvent bool) error {
+	return filepath.Walk(path, func(root string, fi os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 
-		if fi.IsDir() {
-			return w.addDir(p)
+		if !fi.IsDir() {
+			if root == path {
+				return fmt.Errorf("not a directory: %q", path)
+			}
+			return nil
 		}
-		return nil
+		if sedEvent {
+			w.sendEvent(&Event{
+				Type:  "CREATE",
+				Path:  root,
+				IsDir: true,
+			})
+		}
+		return w.register(root, uint32(unix.IN_ALL_EVENTS))
 	})
 }
 
-func (w *sWatcher) addDir(path string) error {
-	w.watchLock.Lock()
-	defer w.watchLock.Unlock()
+func (w *sWatcher) register(path string, flags uint32) error {
+	return w.watches.updatePath(path, func(existing *watch) (*watch, error) {
+		if existing != nil {
+			flags |= existing.flags | unix.IN_MASK_ADD
+		}
+		wd, err := unix.InotifyAddWatch(w.fd, path, flags)
+		if wd == -1 {
+			return nil, err
+		}
+		if existing == nil {
+			return &watch{
+				wd:    uint32(wd),
+				path:  path,
+				flags: flags,
+			}, nil
+		}
+		existing.wd = uint32(wd)
+		existing.flags = flags
+		return existing, nil
+	})
+}
 
-	path = filepath.Clean(path)
-	for _, _path := range w.watchMap {
-		if _path == path {
-			return nil
+func (w *sWatcher) Remove(path string) error {
+	if w.isClosed() {
+		return nil
+	}
+	return w.remove(filepath.Clean(path))
+}
+
+func (w *sWatcher) remove(name string) error {
+	wds, err := w.watches.removePath(name)
+	if err != nil {
+		return err
+	}
+
+	for _, wd := range wds {
+		_, _, err = unix.RawSyscall(syscall.SYS_INOTIFY_RM_WATCH, uintptr(w.fd), uintptr(wd), 0)
+		if err != nil {
+			return err
 		}
 	}
-
-	wd, err := unix.InotifyAddWatch(w.fd, path, unix.IN_ALL_EVENTS)
-	if err != nil {
-		return fmt.Errorf("inotify add watch failed: %w", err)
-	}
-	w.watchMap[int32(wd)] = path
-
 	return nil
 }
 
-func (w *sWatcher) getPath(wd int32) (string, bool) {
-	w.watchLock.Lock()
-	defer w.watchLock.Unlock()
-	path, ok := w.watchMap[wd]
-	return path, ok
+func (w *sWatcher) WatchList() []string {
+	if w.isClosed() {
+		return nil
+	}
+
+	entries := make([]string, 0, w.watches.len())
+	w.watches.mu.RLock()
+	for pathname := range w.watches.path {
+		entries = append(entries, pathname)
+	}
+	w.watches.mu.RUnlock()
+
+	return entries
 }
 
 func (w *sWatcher) eventLoop() {
 	defer func() {
 		recover()
-		_ = unix.Close(w.fd)
-		_ = unix.Close(w.epollFd)
+		close(w.doneResp)
+		close(w.errorChan)
+		close(w.eventChan)
 	}()
-
-	events := make([]unix.EpollEvent, 1)
+	var buf [eventBufferSize]byte
 	for {
-		select {
-		case <-w.done:
+		if w.isClosed() {
 			return
-		default:
-			n, err := unix.EpollWait(w.epollFd, events, -1)
-			if err != nil {
-				if errors.Is(err, unix.EINTR) {
-					continue
-				}
-				w.errors <- fmt.Errorf("epoll wait error: %w", err)
+		}
+		n, err := w.inotifyFile.Read(buf[:])
+		switch {
+		case errors.Is(errors.Unwrap(err), os.ErrClosed):
+			return
+		case err != nil:
+			if !w.sendError(err) {
 				return
 			}
-
-			if n <= 0 {
-				continue
-			}
-			var buf = make([]byte, eventBufferSize)
-			readBytes, err := unix.Read(w.fd, buf)
-			if err != nil && !errors.Is(err, unix.EAGAIN) {
-				w.errors <- fmt.Errorf("read error: %w", err)
-				continue
-			}
-
-			if readBytes > 0 {
-				w.parseEvents(buf[:readBytes])
-			}
-		}
-	}
-}
-
-func (w *sWatcher) parseEvents(data []byte) {
-	offset := 0
-	for offset < len(data) {
-		rawEvent := (*unix.InotifyEvent)(unsafe.Pointer(&data[offset]))
-		offset += unix.SizeofInotifyEvent
-
-		nameBytes := data[offset : offset+int(rawEvent.Len)]
-		name := string(bytes.TrimRight(nameBytes, "\x00"))
-		offset += int(rawEvent.Len)
-
-		basePath, ok := w.getPath(rawEvent.Wd)
-		if !ok {
 			continue
 		}
 
-		fullPath := filepath.Join(basePath, name)
-		isDir := (rawEvent.Mask & unix.IN_ISDIR) != 0
-
-		event := &Event{
-			mask:  rawEvent.Mask,
-			Path:  fullPath,
-			IsDir: isDir,
+		if n < unix.SizeofInotifyEvent {
+			var errno error
+			if n == 0 {
+				errno = io.EOF // If EOF is received. This should really never happen.
+			} else if n < 0 {
+				errno = err // If an error occurred while reading.
+			} else {
+				errno = errors.New("notify: short read in readEvents()") // Read was too short.
+			}
+			if !w.sendError(errno) {
+				return
+			}
+			continue
 		}
-		event.Type = event.typeStr()
-		if strings.Contains(event.Type, "MOVED_FROM") {
-			w.renameMap[rawEvent.Cookie] = event
-		} else if strings.Contains(event.Type, "MOVED_TO") {
-			if fromEvent, exists := w.renameMap[rawEvent.Cookie]; exists {
-				event.Rename = &Rename{
-					From: fromEvent.Path,
-					To:   fullPath,
-				}
-				delete(w.renameMap, rawEvent.Cookie)
+		w.parseEvents(n, buf)
+	}
+}
+
+func (w *sWatcher) parseEvents(n int, data [eventBufferSize]byte) {
+	var offset uint32
+	for offset <= uint32(n-unix.SizeofInotifyEvent) {
+		var (
+			// Point "raw" to the event in the buffer
+			raw     = (*unix.InotifyEvent)(unsafe.Pointer(&data[offset]))
+			mask    = raw.Mask
+			nameLen = raw.Len
+			// Move to the next event in the buffer
+			next = func() { offset += unix.SizeofInotifyEvent + nameLen }
+		)
+
+		if mask&unix.IN_Q_OVERFLOW != 0 {
+			if !w.sendError(fmt.Errorf("queue or buffer overflow")) {
+				return
 			}
 		}
 
-		if isDir {
-			if strings.Contains(event.Type, "CREATE") {
-				_ = w.addWatchRecursive(fullPath)
+		_watch := w.watches.byWd(uint32(raw.Wd))
+		if _watch == nil {
+			next()
+			continue
+		}
+
+		name := _watch.path
+		if nameLen > 0 {
+			/// Point "bytes" at the first byte of the filename
+			_bytes := (*[unix.PathMax]byte)(unsafe.Pointer(&data[offset+unix.SizeofInotifyEvent]))[:nameLen:nameLen]
+			/// The filename is padded with NULL bytes. TrimRight() gets rid of those.
+			name += "/" + strings.TrimRight(string(_bytes[0:nameLen]), "\000")
+		}
+
+		if mask&unix.IN_IGNORED != 0 {
+			next()
+			continue
+		}
+
+		if mask&unix.IN_DELETE_SELF == unix.IN_DELETE_SELF {
+			w.watches.remove(_watch.wd)
+		}
+
+		if mask&unix.IN_MOVE_SELF == unix.IN_MOVE_SELF {
+			next()
+			continue
+		}
+
+		if mask&unix.IN_DELETE_SELF != 0 {
+			if _, ok := w.watches.path[filepath.Dir(_watch.path)]; ok {
+				next()
+				continue
 			}
 		}
-		info, err := os.Stat(fullPath)
-		if err != nil {
-			if os.IsNotExist(err) || strings.Contains(err.Error(), "no such file or directory") {
-				event.Type = "DELETE"
-				w.watchLock.Lock()
-				for _wd, _path := range w.watchMap {
-					if _path == fullPath {
-						delete(w.watchMap, _wd)
+
+		event := w.newEvent(name, mask, raw.Cookie)
+		if event.IsDir && strings.Contains(event.Type, "CREATE") {
+			err := w.addWatchRecursive(event.Path, true)
+			if !w.sendError(err) {
+				return
+			}
+			if event.renamedFrom != "" {
+				w.watches.mu.Lock()
+				for k, ww := range w.watches.wd {
+					if k == _watch.wd || ww.path == event.Path {
+						continue
+					}
+					if strings.HasPrefix(ww.path, event.renamedFrom) {
+						ww.path = strings.Replace(ww.path, event.renamedFrom, event.Path, 1)
+						w.watches.wd[k] = ww
 					}
 				}
-				w.watchLock.Unlock()
-			}
-		}
-		if info != nil {
-			statTtime := info.Sys().(*syscall.Stat_t)
-			event.CreateTime = w.timespecToTime(statTtime.Ctim)
-			event.ModifyTime = w.timespecToTime(statTtime.Mtim)
-			if !event.CreateTime.IsZero() && time.Now().UTC().Sub(event.CreateTime).Seconds() < 1 {
-				event.Type = "CREATE"
+				w.watches.mu.Unlock()
 			}
 		}
 
-		if event.Type != "" {
-			w.handleEventWithDebounce(event)
+		if !w.sendEvent(event) {
+			return
 		}
+		next()
 	}
 }
 
@@ -261,44 +344,71 @@ func (w *sWatcher) timespecToTime(ts syscall.Timespec) time.Time {
 	return time.Unix(ts.Sec, ts.Nsec)
 }
 
-func (w *sWatcher) handleEventWithDebounce(event *Event) {
-	// 对创建事件进行防抖动处理
-	if event.Type == "CREATE" {
-		w.debounceMu.Lock()
-		defer w.debounceMu.Unlock()
+func (w *sWatcher) newEvent(name string, mask, cookie uint32) *Event {
+	var _mask uint32
+	e := &Event{
+		Path:  name,
+		IsDir: mask&unix.IN_ISDIR == unix.IN_ISDIR,
+	}
+	if mask&unix.IN_CREATE == unix.IN_CREATE || mask&unix.IN_MOVED_TO == unix.IN_MOVED_TO {
+		_mask |= unix.IN_CREATE
+	}
+	if mask&unix.IN_DELETE_SELF == unix.IN_DELETE_SELF || mask&unix.IN_DELETE == unix.IN_DELETE {
+		_mask |= unix.IN_DELETE
+	}
+	if mask&unix.IN_MODIFY == unix.IN_MODIFY {
+		_mask |= unix.IN_MODIFY
+	}
+	if mask&unix.IN_OPEN == unix.IN_OPEN {
+		_mask |= unix.IN_OPEN
+	}
+	if mask&unix.IN_ACCESS == unix.IN_ACCESS {
+		_mask |= unix.IN_ACCESS
+	}
+	if mask&unix.IN_CLOSE_WRITE == unix.IN_CLOSE_WRITE {
+		_mask |= unix.IN_CLOSE
+	}
+	if mask&unix.IN_CLOSE_NOWRITE == unix.IN_CLOSE_NOWRITE {
+		_mask |= unix.IN_CLOSE
+	}
+	if mask&unix.IN_MOVE_SELF == unix.IN_MOVE_SELF || mask&unix.IN_MOVED_FROM == unix.IN_MOVED_FROM {
+		_mask |= unix.IN_MOVE
+	}
+	if mask&unix.IN_ATTRIB == unix.IN_ATTRIB {
+		_mask |= unix.IN_ATTRIB
+	}
 
-		key := event.Path
-		// 如果存在现有定时器，则重置
-		if timer, exists := w.debounceMap[key]; exists {
-			timer.Stop()
-			delete(w.debounceMap, key)
+	if cookie != 0 {
+		if mask&unix.IN_MOVED_FROM == unix.IN_MOVED_FROM {
+			w.cookiesMu.Lock()
+			w.cookies[w.cookieIndex] = koekje{cookie: cookie, path: e.Path}
+			w.cookieIndex++
+			if w.cookieIndex > 9 {
+				w.cookieIndex = 0
+			}
+			w.cookiesMu.Unlock()
+		} else if mask&unix.IN_MOVED_TO == unix.IN_MOVED_TO {
+			w.cookiesMu.Lock()
+			var prev string
+			for _, c := range w.cookies {
+				if c.cookie == cookie {
+					prev = c.path
+					break
+				}
+			}
+			w.cookiesMu.Unlock()
+			e.renamedFrom = prev
 		}
-
-		// 创建新定时器延迟发送事件
-		timer := time.AfterFunc(w.debounceDuration, func() {
-			w.debounceMu.Lock()
-			delete(w.debounceMap, key)
-			w.debounceMu.Unlock()
-			w.eventChan <- event
-		})
-		w.debounceMap[key] = timer
-	} else {
-		// 其他事件类型直接发送
-		w.eventChan <- event
 	}
-}
-
-func (w *sWatcher) Close() {
-	close(w.done)
-
-	// 停止所有防抖动定时器
-	w.debounceMu.Lock()
-	for _, timer := range w.debounceMap {
-		timer.Stop()
+	var res []string
+	for k, v := range eventBits {
+		if _mask&k == _mask {
+			res = append(res, v)
+		}
 	}
-	w.debounceMap = make(map[string]*time.Timer) // 清空防抖动映射
-	w.debounceMu.Unlock()
-
-	close(w.eventChan)
-	close(w.errors)
+	if len(res) == 0 {
+		e.Type = "UNKNOWN"
+	}
+	e.Type = strings.Join(res, "|")
+	return e
 }
