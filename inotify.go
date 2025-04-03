@@ -159,7 +159,7 @@ func (w *sWatcher) addWatchRecursive(path string, sedEvent bool) error {
 		}
 		if sedEvent {
 			w.sendEvent(&Event{
-				Type:  "CREATE",
+				Type:  unix.IN_CREATE,
 				Path:  root,
 				IsDir: true,
 			})
@@ -341,19 +341,19 @@ func (w *sWatcher) parseEvents(n int, data []byte) {
 		}
 
 		event := w.newEvent(name, mask, raw.Cookie)
-		if event.IsDir && strings.Contains(event.Type, "CREATE") {
+		if event.IsDir && event.Has(unix.IN_CREATE) {
 			err := w.addWatchRecursive(event.Path, true)
 			if !w.sendError(err) {
 				return
 			}
-			if event.renamedFrom != "" {
+			if event.RenamedFrom != "" {
 				w.watches.mu.Lock()
 				for k, ww := range w.watches.wd {
 					if k == _watch.wd || ww.path == event.Path {
 						continue
 					}
-					if strings.HasPrefix(ww.path, event.renamedFrom) {
-						ww.path = strings.Replace(ww.path, event.renamedFrom, event.Path, 1)
+					if strings.HasPrefix(ww.path, event.RenamedFrom) {
+						ww.path = strings.Replace(ww.path, event.RenamedFrom, event.Path, 1)
 						w.watches.wd[k] = ww
 					}
 				}
@@ -376,37 +376,36 @@ func (w *sWatcher) timespecToTime(ts syscall.Timespec) time.Time {
 }
 
 func (w *sWatcher) newEvent(name string, mask, cookie uint32) *Event {
-	var _mask uint32
 	e := &Event{
 		Path:  name,
 		IsDir: mask&unix.IN_ISDIR == unix.IN_ISDIR,
 	}
 	if mask&unix.IN_CREATE == unix.IN_CREATE || mask&unix.IN_MOVED_TO == unix.IN_MOVED_TO {
-		_mask |= unix.IN_CREATE
+		e.Type |= CREATE
 	}
 	if mask&unix.IN_DELETE_SELF == unix.IN_DELETE_SELF || mask&unix.IN_DELETE == unix.IN_DELETE {
-		_mask |= unix.IN_DELETE
+		e.Type |= DELETE
 	}
 	if mask&unix.IN_MODIFY == unix.IN_MODIFY {
-		_mask |= unix.IN_MODIFY
+		e.Type |= MODIFY
 	}
 	if mask&unix.IN_OPEN == unix.IN_OPEN {
-		_mask |= unix.IN_OPEN
+		e.Type |= OPEN
 	}
 	if mask&unix.IN_ACCESS == unix.IN_ACCESS {
-		_mask |= unix.IN_ACCESS
+		e.Type |= unix.IN_ACCESS
 	}
 	if mask&unix.IN_CLOSE_WRITE == unix.IN_CLOSE_WRITE {
-		_mask |= unix.IN_CLOSE
+		e.Type |= CLOSE
 	}
 	if mask&unix.IN_CLOSE_NOWRITE == unix.IN_CLOSE_NOWRITE {
-		_mask |= unix.IN_CLOSE
+		e.Type |= CLOSE
 	}
 	if mask&unix.IN_MOVE_SELF == unix.IN_MOVE_SELF || mask&unix.IN_MOVED_FROM == unix.IN_MOVED_FROM {
-		_mask |= unix.IN_MOVE
+		e.Type |= MOVE
 	}
 	if mask&unix.IN_ATTRIB == unix.IN_ATTRIB {
-		_mask |= unix.IN_ATTRIB
+		e.Type |= ATTRIB
 	}
 
 	if cookie != 0 {
@@ -428,18 +427,8 @@ func (w *sWatcher) newEvent(name string, mask, cookie uint32) *Event {
 				}
 			}
 			w.cookiesMu.Unlock()
-			e.renamedFrom = prev
+			e.RenamedFrom = prev
 		}
 	}
-	var res []string
-	for k, v := range eventBits {
-		if _mask&k == _mask {
-			res = append(res, v)
-		}
-	}
-	if len(res) == 0 {
-		e.Type = "UNKNOWN"
-	}
-	e.Type = strings.Join(res, "|")
 	return e
 }
