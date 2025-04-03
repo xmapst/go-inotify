@@ -17,7 +17,7 @@ type (
 		Type        Op     `json:"type"`
 		Path        string `json:"path"`
 		IsDir       bool   `json:"is_dir"`
-		RenamedFrom string
+		RenamedFrom string `json:"renamed_from,omitempty"`
 	}
 )
 

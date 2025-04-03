@@ -32,9 +32,9 @@ type sWatcher struct {
 	eventChan chan *Event
 	errorChan chan error
 
-	fd      int
-	epollFd int
-	watches *watches
+	fd          int
+	inotifyFile *os.File
+	watches     *watches
 
 	done     chan struct{}
 	doneMu   sync.Mutex
@@ -51,29 +51,14 @@ func New() (IWatcher, error) {
 		return nil, fmt.Errorf("inotify init failed: %w", err)
 	}
 
-	epollFd, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
-	if err != nil {
-		_ = unix.Close(fd)
-		return nil, fmt.Errorf("epoll create failed: %w", err)
-	}
-
-	if err = unix.EpollCtl(epollFd, unix.EPOLL_CTL_ADD, fd, &unix.EpollEvent{
-		Events: unix.EPOLLIN,
-		Fd:     int32(fd),
-	}); err != nil {
-		_ = unix.Close(fd)
-		_ = unix.Close(epollFd)
-		return nil, fmt.Errorf("epoll ctl failed: %w", err)
-	}
-
 	w := &sWatcher{
-		fd:        fd,
-		epollFd:   epollFd,
-		watches:   newWatches(),
-		eventChan: make(chan *Event, 65535),
-		errorChan: make(chan error, 1024),
-		done:      make(chan struct{}),
-		doneResp:  make(chan struct{}),
+		fd:          fd,
+		inotifyFile: os.NewFile(uintptr(fd), ""),
+		watches:     newWatches(),
+		eventChan:   make(chan *Event, 65535),
+		errorChan:   make(chan error, 1024),
+		done:        make(chan struct{}),
+		doneResp:    make(chan struct{}),
 	}
 
 	go w.eventLoop()
@@ -120,7 +105,10 @@ func (w *sWatcher) Close() error {
 	w.doneMu.Unlock()
 
 	_ = unix.Close(w.fd)
-	_ = unix.Close(w.epollFd)
+	err := w.inotifyFile.Close()
+	if err != nil {
+		return err
+	}
 	<-w.doneResp
 	return nil
 }
@@ -234,60 +222,41 @@ func (w *sWatcher) eventLoop() {
 		close(w.errorChan)
 		close(w.eventChan)
 	}()
-	events := make([]unix.EpollEvent, 1)
+	var buf [eventBufferSize]byte
 	for {
-		select {
-		case <-w.done:
+		if w.isClosed() {
 			return
-		default:
-			// blocking mode cannot be used, otherwise goroutine will leak
-			n, err := unix.EpollWait(w.epollFd, events, 0)
-			if err != nil {
-				if errors.Is(err, unix.EINTR) {
-					continue
-				}
-				w.sendError(fmt.Errorf("epoll wait error: %w", err))
-				return
-			}
-
-			if n <= 0 {
-				continue
-			}
-
-			var buf = make([]byte, eventBufferSize)
-			readBytes, err := unix.Read(w.fd, buf)
-			switch {
-			case errors.Is(errors.Unwrap(err), unix.EAGAIN):
-				return
-			case err != nil:
-				if !w.sendError(err) {
-					return
-				}
-				continue
-			}
-
-			if readBytes < unix.SizeofInotifyEvent {
-				var errno error
-				if readBytes == 0 {
-					errno = io.EOF // If EOF is received. This should really never happen.
-				} else if readBytes < 0 {
-					errno = err // If an error occurred while reading.
-				} else {
-					errno = errors.New("notify: short read in eventLoop()") // Read was too short.
-				}
-				if !w.sendError(errno) {
-					return
-				}
-				continue
-			}
-			if readBytes > 0 {
-				w.parseEvents(readBytes, buf)
-			}
 		}
+		n, err := w.inotifyFile.Read(buf[:])
+		switch {
+		case errors.Is(errors.Unwrap(err), os.ErrClosed):
+			return
+		case err != nil:
+			if !w.sendError(err) {
+				return
+			}
+			continue
+		}
+
+		if n < unix.SizeofInotifyEvent {
+			var errno error
+			if n == 0 {
+				errno = io.EOF // If EOF is received. This should really never happen.
+			} else if n < 0 {
+				errno = err // If an error occurred while reading.
+			} else {
+				errno = errors.New("notify: short read in readEvents()") // Read was too short.
+			}
+			if !w.sendError(errno) {
+				return
+			}
+			continue
+		}
+		w.parseEvents(n, buf)
 	}
 }
 
-func (w *sWatcher) parseEvents(n int, data []byte) {
+func (w *sWatcher) parseEvents(n int, data [eventBufferSize]byte) {
 	var offset uint32
 	for offset <= uint32(n-unix.SizeofInotifyEvent) {
 		var (
