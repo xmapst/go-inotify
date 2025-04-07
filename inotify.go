@@ -139,30 +139,7 @@ func (w *sWatcher) AddWith(path string, mark Op) error {
 		return fmt.Errorf("get abs path failed: %w", err)
 	}
 	// required type, recursive directories required
-	var _flags = unix.IN_DONT_FOLLOW | unix.IN_CREATE | unix.IN_DELETE |
-		unix.IN_DELETE_SELF | unix.IN_IGNORED | unix.IN_UNMOUNT
-	if mark&ALL_EVENTS == ALL_EVENTS {
-		_flags = unix.IN_ALL_EVENTS
-	} else {
-		if mark&ACCESS != 0 {
-			_flags |= unix.IN_ACCESS
-		}
-		if mark&ATTRIB != 0 {
-			_flags |= unix.IN_ATTRIB
-		}
-		if mark&CLOSE != 0 {
-			_flags |= unix.IN_CLOSE | unix.IN_CLOSE_WRITE | unix.IN_CLOSE_NOWRITE
-		}
-		if mark&MODIFY != 0 {
-			_flags |= unix.IN_MODIFY
-		}
-		if mark&MOVE != 0 {
-			_flags |= unix.IN_MOVED_TO | unix.IN_MOVED_FROM | unix.IN_MOVE_SELF
-		}
-		if mark&OPEN != 0 {
-			_flags |= unix.IN_OPEN
-		}
-	}
+	var _flags = unix.IN_ALL_EVENTS | unix.IN_DONT_FOLLOW | unix.IN_IGNORED | unix.IN_UNMOUNT
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
